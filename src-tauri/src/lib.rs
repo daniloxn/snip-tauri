@@ -89,28 +89,15 @@ fn close_overlay_windows(app: tauri::AppHandle) {
     }
 }
 
-#[tauri::command]
-fn translate_text(app: tauri::AppHandle, text: String) -> Result<String, String> {
-    let settings = load_settings(app.clone());
-
-    if settings.deepl_api_key.is_empty() {
-        return Err(
-            "DeepL API Key não configurada. Vá em Configurações e adicione sua chave.".to_string(),
-        );
-    }
-
-    let target_lang = settings.translate_to.to_uppercase();
-
+fn translate_text(text: &str, api_key: &str, target_lang: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
+
     let response = client
         .post("https://api-free.deepl.com/v2/translate")
-        .header(
-            "Authorization",
-            format!("DeepL-Auth-Key {}", settings.deepl_api_key),
-        )
+        .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
         .json(&serde_json::json!({
             "text": [text],
-            "target_lang": target_lang,
+            "target_lang": target_lang.to_uppercase(),
         }))
         .send()
         .map_err(|e| format!("Erro ao chamar DeepL: {}", e))?;
@@ -145,18 +132,26 @@ fn translate_text(app: tauri::AppHandle, text: String) -> Result<String, String>
 }
 
 #[tauri::command]
-fn capture_and_ocr(
+fn translate_text_cmd(
     app: tauri::AppHandle,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    text: String,
+    target_lang: Option<String>,
 ) -> Result<String, String> {
+    let settings = load_settings(app.clone());
+
+    if settings.deepl_api_key.is_empty() {
+        return Err("DeepL API Key não configurada.".to_string());
+    }
+
+    let lang = target_lang.unwrap_or(settings.translate_to);
+    translate_text(&text, &settings.deepl_api_key, &lang)
+}
+
+fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, String> {
     use screenshots::Screen;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // 1. Descobre qual tela
+    // Descobre qual monitor contém o ponto (x, y)
     let screens = Screen::all().map_err(|e| e.to_string())?;
     let target = screens
         .iter()
@@ -172,43 +167,39 @@ fn capture_and_ocr(
     let rel_x = x - target.display_info.x as i32;
     let rel_y = y - target.display_info.y as i32;
 
-    // 2. Captura a área
+    // Captura só a área selecionada
     let image = target
         .capture_area(rel_x, rel_y, w as u32, h as u32)
         .map_err(|e| e.to_string())?;
 
+    // Salva em arquivo temporário com nome único
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let temp_path = std::env::temp_dir().join(format!("snipp_{}.png", timestamp));
 
-    // 3. Salva temporariamente
     image.save(&temp_path).map_err(|e| e.to_string())?;
 
-    let tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe";
+    println!("📸 Capturado: {}", temp_path.display());
+    Ok(temp_path)
+}
+
+fn run_ocr(image_path: &std::path::Path, ocr_lang: &str) -> Result<String, String> {
+    use std::process::Command;
+
+    let tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe";
     let tessdata = r"C:\Program Files\Tesseract-OCR\tessdata";
-    let settings = load_settings(app.clone());
-    // 4. Roda o Tesseract
-    let output = Command::new(tesseract_path)
-        .arg(temp_path.to_string_lossy().to_string())
+
+    let output = Command::new(tesseract)
+        .arg(image_path.to_string_lossy().to_string())
         .arg("stdout")
         .arg("-l")
-        .arg(&settings.ocr_lang)
+        .arg(ocr_lang)
         .env("TESSDATA_PREFIX", tessdata)
         .output()
-        .map_err(|e| {
-            format!(
-                "Erro ao executar Tesseract: {}. Instalou e marcou Add to PATH?",
-                e
-            )
-        })?;
+        .map_err(|e| format!("Erro ao executar Tesseract: {}", e))?;
 
-    // 5. Apaga o temp
-    let _ = std::fs::remove_file(&temp_path);
-
-    // 6. Retorna o texto
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if text.is_empty() {
@@ -221,6 +212,15 @@ fn capture_and_ocr(
         let err = String::from_utf8_lossy(&output.stderr);
         Err(format!("Erro no OCR: {}", err))
     }
+}
+
+#[tauri::command]
+fn capture_and_ocr(x: i32, y: i32, w: i32, h: i32, lang: Option<String>) -> Result<String, String> {
+    let path = capture_area(x, y, w, h)?;
+    let ocr_lang = lang.unwrap_or_else(|| "por".to_string());
+    let text = run_ocr(&path, &ocr_lang)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(text)
 }
 
 #[tauri::command]
@@ -291,158 +291,6 @@ fn show_result(app: tauri::AppHandle, text: String) {
             .center()
             .title("Snipp - Resultado")
             .build();
-}
-
-#[tauri::command]
-fn capture_region_and_translate(
-    app: tauri::AppHandle,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> Result<String, String> {
-    use screenshots::Screen;
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // 1. Carrega settings
-    let settings = load_settings(app.clone());
-
-    // 2. Descobre qual tela
-    let screens = Screen::all().map_err(|e| e.to_string())?;
-    let target = screens
-        .iter()
-        .find(|s| {
-            let dx = s.display_info.x as i32;
-            let dy = s.display_info.y as i32;
-            let dw = s.display_info.width as i32;
-            let dh = s.display_info.height as i32;
-            x >= dx && x < dx + dw && y >= dy && y < dy + dh
-        })
-        .ok_or_else(|| format!("Nenhuma tela no ponto ({}, {})", x, y))?;
-
-    let rel_x = x - target.display_info.x as i32;
-    let rel_y = y - target.display_info.y as i32;
-
-    // 3. Captura a área
-    let image = target
-        .capture_area(rel_x, rel_y, w as u32, h as u32)
-        .map_err(|e| e.to_string())?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let temp_path = std::env::temp_dir().join(format!("snipp_{}.png", timestamp));
-    image.save(&temp_path).map_err(|e| e.to_string())?;
-
-    // 4. OCR
-    let tesseract = r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe";
-    let tessdata = r"C:\Program Files (x86)\Tesseract-OCR\tessdata";
-
-    let ocr_output = Command::new(tesseract)
-        .arg(temp_path.to_string_lossy().to_string())
-        .arg("stdout")
-        .arg("-l")
-        .arg(&settings.ocr_lang)
-        .env("TESSDATA_PREFIX", tessdata)
-        .output()
-        .map_err(|e| format!("Erro ao executar Tesseract: {}", e))?;
-
-    let _ = std::fs::remove_file(&temp_path);
-
-    let ocr_text = if ocr_output.status.success() {
-        String::from_utf8_lossy(&ocr_output.stdout)
-            .trim()
-            .to_string()
-    } else {
-        return Err("Erro no OCR".to_string());
-    };
-
-    if ocr_text.is_empty() {
-        return Err("(nenhum texto encontrado)".to_string());
-    }
-
-    println!("📝 OCR: {}", ocr_text);
-
-    // 5. Tradução (se tiver API Key)
-    let translated_text = if !settings.deepl_api_key.is_empty() {
-        let target_lang = settings.translate_to.to_uppercase();
-        let client = reqwest::blocking::Client::new();
-        match client
-            .post("https://api-free.deepl.com/v2/translate")
-            .header(
-                "Authorization",
-                format!("DeepL-Auth-Key {}", settings.deepl_api_key),
-            )
-            .json(&serde_json::json!({ "text": [ocr_text], "target_lang": target_lang }))
-            .send()
-        {
-            Ok(resp) if resp.status().is_success() => {
-                #[derive(serde::Deserialize)]
-                struct DeepLResponse {
-                    translations: Vec<Translation>,
-                }
-                #[derive(serde::Deserialize)]
-                struct Translation {
-                    text: String,
-                }
-                match resp.json::<DeepLResponse>() {
-                    Ok(r) => r
-                        .translations
-                        .first()
-                        .map(|t| t.text.clone())
-                        .unwrap_or_default(),
-                    Err(_) => "(erro ao traduzir)".to_string(),
-                }
-            }
-            _ => "(erro ao traduzir)".to_string(),
-        }
-    } else {
-        String::new()
-    };
-
-    if !translated_text.is_empty() {
-        println!("🌐 Traduzido: {}", translated_text);
-    }
-
-    // 6. Salva os resultados
-    let result = format!("OCR:{}\nTRAD:{}\n", ocr_text, translated_text);
-    if let Ok(mut last) = LAST_OCR_RESULT.lock() {
-        *last = result;
-    }
-
-    // 7. Fecha todos os overlays
-    for label in app.webview_windows().keys() {
-        if label.starts_with("overlay-") {
-            if let Some(window) = app.get_webview_window(label) {
-                let _ = window.close();
-            }
-        }
-    }
-
-    // 8. Abre janela de resultado
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    if let Some(window) = app.get_webview_window("result") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        let _ = tauri::WebviewWindowBuilder::new(
-            &app,
-            "result",
-            tauri::WebviewUrl::App("/result".into()),
-        )
-        .inner_size(520.0, 640.0)
-        .min_inner_size(400.0, 400.0)
-        .resizable(true)
-        .decorations(true)
-        .center()
-        .title("Snipp - Resultado")
-        .build();
-    }
-
-    Ok(ocr_text)
 }
 
 pub fn run() {
@@ -569,16 +417,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             show_window,
             close_overlay_windows,
-            capture_and_ocr,
             log_coords,
             load_settings,
             save_settings,
-            translate_text,
+            translate_text_cmd,
+            capture_and_ocr,
             show_result_window,
             get_last_ocr_result,
             close_result_window,
-            show_result,
-            capture_region_and_translate
+            show_result
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
