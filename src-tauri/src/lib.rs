@@ -20,6 +20,11 @@ pub struct AppSettings {
     pub translate_to: String,
 }
 
+struct TesseractPaths {
+    exe: PathBuf,
+    tessdata: PathBuf,
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -185,21 +190,31 @@ fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, St
     Ok(temp_path)
 }
 
-fn run_ocr(image_path: &std::path::Path, ocr_lang: &str) -> Result<String, String> {
+fn run_ocr(
+    app: &tauri::AppHandle,
+    image_path: &std::path::Path,
+    ocr_lang: &str,
+) -> Result<String, String> {
     use std::process::Command;
 
-    let tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe";
-    let tessdata = r"C:\Program Files\Tesseract-OCR\tessdata";
+    let tess_paths = app.state::<TesseractPaths>();
 
-    let output = Command::new(tesseract)
+    let output = Command::new(&tess_paths.exe)
         .arg(image_path.to_string_lossy().to_string())
         .arg("stdout")
         .arg("-l")
         .arg(ocr_lang)
-        .env("TESSDATA_PREFIX", tessdata)
+        .env("TESSDATA_PREFIX", &tess_paths.tessdata)
         .output()
         .map_err(|e| format!("Erro ao executar Tesseract: {}", e))?;
 
+    println!("🔍 Debug OCR:");
+    println!("   exe: {:?}", tess_paths.exe);
+    println!("   tessdata: {:?}", tess_paths.tessdata);
+    println!("   imagem: {:?}", image_path);
+    println!("   lang: {}", ocr_lang);
+    println!("   tessdata existe? {}", tess_paths.tessdata.exists());
+    println!("   exe existe? {}", tess_paths.exe.exists());
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if text.is_empty() {
@@ -215,10 +230,17 @@ fn run_ocr(image_path: &std::path::Path, ocr_lang: &str) -> Result<String, Strin
 }
 
 #[tauri::command]
-fn capture_and_ocr(x: i32, y: i32, w: i32, h: i32, lang: Option<String>) -> Result<String, String> {
+fn capture_and_ocr(
+    app: tauri::AppHandle,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    lang: Option<String>,
+) -> Result<String, String> {
     let path = capture_area(x, y, w, h)?;
     let ocr_lang = lang.unwrap_or_else(|| "por".to_string());
-    let text = run_ocr(&path, &ocr_lang)?;
+    let text = run_ocr(&app, &path, &ocr_lang)?;
     let _ = std::fs::remove_file(&path);
     Ok(text)
 }
@@ -296,10 +318,77 @@ fn show_result(app: tauri::AppHandle, text: String) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // Esconde a janela ao iniciar
+            // Resolve caminhos do Tesseract
+            let (tesseract_exe, tesseract_tessdata) = {
+                // Lista de lugares pra procurar, em ordem de prioridade
+                let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+                // 1) Pasta binaries/ do lado do executável (funciona no .exe se colocar junto)
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe.parent() {
+                        candidates.push((
+                            exe_dir.join("binaries/tesseract.exe"),
+                            exe_dir.join("binaries/tessdata"),
+                        ));
+                    }
+                }
+
+                // 2) Resource dir (caminho que o Tauri usa em produção)
+                if let Ok(resource) = app.path().resource_dir() {
+                    candidates.push((
+                        resource.join("binaries/tesseract.exe"),
+                        resource.join("binaries/tessdata"),
+                    ));
+                }
+
+                // 3) Pasta src-tauri/binaries/ relativa ao diretório atual (funciona no dev)
+                if let Ok(cwd) = std::env::current_dir() {
+                    candidates.push((
+                        cwd.join("src-tauri/binaries/tesseract.exe"),
+                        cwd.join("src-tauri/binaries/tessdata"),
+                    ));
+                }
+
+                // 4) Instalação padrão do Windows
+                candidates.push((
+                    PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+                    PathBuf::from(r"C:\Program Files\Tesseract-OCR\tessdata"),
+                ));
+
+                // Procura o primeiro que existe
+                let mut found = None;
+                for (exe_path, tess_path) in &candidates {
+                    if exe_path.exists() && tess_path.exists() {
+                        println!("✅ Tesseract encontrado em: {:?}", exe_path);
+                        found = Some((exe_path.clone(), tess_path.clone()));
+                        break;
+                    }
+                }
+
+                found.unwrap_or_else(|| {
+                    eprintln!("⚠️ Tesseract não encontrado em nenhum lugar!");
+                    eprintln!("   Crie a pasta src-tauri/binaries/ com tesseract.exe e tessdata/");
+                    // Retorna o último candidato mesmo assim — o erro vai aparecer naturalmente
+                    candidates.last().cloned().unwrap()
+                })
+            };
+
+            app.manage(TesseractPaths {
+                exe: tesseract_exe,
+                tessdata: tesseract_tessdata,
+            });
+
+            println!(
+                "🔧 Usando Tesseract: {:?}",
+                app.state::<TesseractPaths>().exe
+            );
+            println!(
+                "🔧 Usando tessdata: {:?}",
+                app.state::<TesseractPaths>().tessdata
+            );
+
+            // Configura a janela principal — a rota é decidida pelo frontend
             if let Some(window) = app.get_webview_window("main") {
-                let _ =
-                    window.navigate(tauri::Url::parse("http://localhost:1420/settings").unwrap());
                 let _ = window.set_size(tauri::LogicalSize::new(480.0, 640.0));
                 let _ = window.set_resizable(false);
                 let _ = window.center();
@@ -307,7 +396,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
 
-            // 4. Fechar = minimizar pro tray (não sair)
+            // Fechar = minimizar pro tray (não sair)
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| {
