@@ -27,4 +27,5 @@ rdev = "0.5.3"
 chrono = "0.4.45"
 reqwest = {version = "0.13.4", features = ["blocking", "json"] }
 base64 = "0.22.1"
+png = "0.18.1"
 

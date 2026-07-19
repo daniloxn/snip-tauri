@@ -193,12 +193,7 @@ fn run_ocr(
 
     let tess_paths = app.state::<TesseractPaths>();
 
-    println!("🔍 Tess path: {:?}", &tess_paths.exe); // paths → tess_paths
-    println!("🔍 Tess exists: {}", tess_paths.exe.exists()); // paths → tess_paths
-    println!("🔍 Tessdata path: {:?}", &tess_paths.tessdata); // paths → tess_paths
-    println!("🔍 Tessdata exists: {}", tess_paths.tessdata.exists()); // paths → tess_paths
-    println!("🔍 Image path: {:?}", image_path);
-    println!("🔍 Image exists: {}", image_path.exists());
+    use std::os::windows::process::CommandExt;
     let output = Command::new(&tess_paths.exe)
         .arg(image_path.to_string_lossy().to_string())
         .arg("stdout")

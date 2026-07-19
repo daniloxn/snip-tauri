@@ -3977,6 +3977,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "png 0.18.1",
  "rdev",
  "reqwest",
  "screenshots",
