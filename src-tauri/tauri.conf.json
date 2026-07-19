@@ -32,7 +32,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "binaries/**/*": "binaries/"
+      "binaries/tesseract.exe": "binaries/tesseract.exe",
+      "binaries/tessdata/*": "binaries/tessdata/"
     }
   }
 }

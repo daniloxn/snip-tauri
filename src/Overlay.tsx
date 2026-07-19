@@ -158,7 +158,9 @@ function Overlay() {
           targetLang: translateLang,
         });
         setTranslatedResult(translated);
-      } catch {
+      } catch (error:any) {
+        const msg = typeof error === 'string' ? error : error?.message || 'Erro na tradução';
+        setTranslatedResult(msg);
         // mantém só o OCR
       } finally {
         setTranslating(false);

@@ -1,28 +1,32 @@
-use rdev::{listen, Event, EventType, Key};
+use rdev::{listen, EventType, Key};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::{sync::Mutex, time::UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    window, Emitter, Manager, WebviewWindowBuilder,
+    Manager,
 };
 
+struct TesseractPaths {
+    exe: PathBuf,
+    tessdata: PathBuf,
+}
+
 static LAST_OCR_RESULT: Mutex<String> = Mutex::new(String::new());
-static ALT_PRESSED: Mutex<bool> = Mutex::new(false);
-static SHIFT_PRESSED: Mutex<bool> = Mutex::new(false);
+
+struct ShortcutState(Arc<Mutex<String>>);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub deepl_api_key: String,
     pub ocr_lang: String,
     pub translate_to: String,
-}
-
-struct TesseractPaths {
-    exe: PathBuf,
-    tessdata: PathBuf,
+    pub shortcut: String,
+    pub ocr_mode: String, // "online" ou "local"
+    pub gemini_api_key: String,
 }
 
 impl Default for AppSettings {
@@ -31,6 +35,9 @@ impl Default for AppSettings {
             deepl_api_key: String::new(),
             ocr_lang: "por".to_string(),
             translate_to: "en".to_string(),
+            shortcut: "Ctrl+Shift+S".to_string(),
+            ocr_mode: "online".to_string(),
+            gemini_api_key: String::new(),
         }
     }
 }
@@ -54,12 +61,15 @@ fn load_settings(app: tauri::AppHandle) -> AppSettings {
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: AppSettings) {
+    // Atualiza o atalho em tempo real pro keyhook
+    if let Some(state) = app.try_state::<ShortcutState>() {
+        *state.0.lock().unwrap() = settings.shortcut.clone();
+    }
     let path = settings_path(&app);
     let json = serde_json::to_string_pretty(&settings).unwrap();
     fs::write(&path, json).unwrap();
 }
 
-// Printando as cordenadas selecionada.
 #[tauri::command]
 fn log_coords(x: i32, y: i32, w: i32, h: i32) {
     println!(
@@ -68,7 +78,6 @@ fn log_coords(x: i32, y: i32, w: i32, h: i32) {
     );
 }
 
-// Função para mostrar a janela
 #[tauri::command]
 fn show_window(app: tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -77,7 +86,6 @@ fn show_window(app: tauri::AppHandle) {
     }
 }
 
-// Função para fechar todas as overlay quando a tecla ESC for pressionada.
 #[tauri::command]
 fn close_overlay_windows(app: tauri::AppHandle) {
     let labels: Vec<String> = app
@@ -86,7 +94,6 @@ fn close_overlay_windows(app: tauri::AppHandle) {
         .filter(|l| l.starts_with("overlay"))
         .cloned()
         .collect();
-
     for label in labels {
         if let Some(window) = app.get_webview_window(&label) {
             let _ = window.close();
@@ -96,7 +103,6 @@ fn close_overlay_windows(app: tauri::AppHandle) {
 
 fn translate_text(text: &str, api_key: &str, target_lang: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
-
     let response = client
         .post("https://api-free.deepl.com/v2/translate")
         .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
@@ -106,13 +112,11 @@ fn translate_text(text: &str, api_key: &str, target_lang: &str) -> Result<String
         }))
         .send()
         .map_err(|e| format!("Erro ao chamar DeepL: {}", e))?;
-
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
         return Err(format!("DeepL retornou erro {}: {}", status, body));
     }
-
     #[derive(serde::Deserialize)]
     struct DeepLResponse {
         translations: Vec<Translation>,
@@ -121,17 +125,14 @@ fn translate_text(text: &str, api_key: &str, target_lang: &str) -> Result<String
     struct Translation {
         text: String,
     }
-
     let result: DeepLResponse = response
         .json()
         .map_err(|e| format!("Erro ao parsear resposta do DeepL: {}", e))?;
-
     let translated = result
         .translations
         .first()
         .map(|t| t.text.clone())
         .unwrap_or_default();
-
     println!("🌐 Traduzido: {}", translated);
     Ok(translated)
 }
@@ -143,11 +144,9 @@ fn translate_text_cmd(
     target_lang: Option<String>,
 ) -> Result<String, String> {
     let settings = load_settings(app.clone());
-
     if settings.deepl_api_key.is_empty() {
         return Err("DeepL API Key não configurada.".to_string());
     }
-
     let lang = target_lang.unwrap_or(settings.translate_to);
     translate_text(&text, &settings.deepl_api_key, &lang)
 }
@@ -156,7 +155,6 @@ fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, St
     use screenshots::Screen;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Descobre qual monitor contém o ponto (x, y)
     let screens = Screen::all().map_err(|e| e.to_string())?;
     let target = screens
         .iter()
@@ -172,20 +170,16 @@ fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, St
     let rel_x = x - target.display_info.x as i32;
     let rel_y = y - target.display_info.y as i32;
 
-    // Captura só a área selecionada
     let image = target
         .capture_area(rel_x, rel_y, w as u32, h as u32)
         .map_err(|e| e.to_string())?;
 
-    // Salva em arquivo temporário com nome único
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let temp_path = std::env::temp_dir().join(format!("snipp_{}.png", timestamp));
-
     image.save(&temp_path).map_err(|e| e.to_string())?;
-
     println!("📸 Capturado: {}", temp_path.display());
     Ok(temp_path)
 }
@@ -199,6 +193,12 @@ fn run_ocr(
 
     let tess_paths = app.state::<TesseractPaths>();
 
+    println!("🔍 Tess path: {:?}", &tess_paths.exe); // paths → tess_paths
+    println!("🔍 Tess exists: {}", tess_paths.exe.exists()); // paths → tess_paths
+    println!("🔍 Tessdata path: {:?}", &tess_paths.tessdata); // paths → tess_paths
+    println!("🔍 Tessdata exists: {}", tess_paths.tessdata.exists()); // paths → tess_paths
+    println!("🔍 Image path: {:?}", image_path);
+    println!("🔍 Image exists: {}", image_path.exists());
     let output = Command::new(&tess_paths.exe)
         .arg(image_path.to_string_lossy().to_string())
         .arg("stdout")
@@ -208,13 +208,6 @@ fn run_ocr(
         .output()
         .map_err(|e| format!("Erro ao executar Tesseract: {}", e))?;
 
-    println!("🔍 Debug OCR:");
-    println!("   exe: {:?}", tess_paths.exe);
-    println!("   tessdata: {:?}", tess_paths.tessdata);
-    println!("   imagem: {:?}", image_path);
-    println!("   lang: {}", ocr_lang);
-    println!("   tessdata existe? {}", tess_paths.tessdata.exists());
-    println!("   exe existe? {}", tess_paths.exe.exists());
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if text.is_empty() {
@@ -229,6 +222,51 @@ fn run_ocr(
     }
 }
 
+fn run_ocr_online(image_path: &std::path::Path, api_key: &str) -> Result<String, String> {
+    let image_bytes =
+        std::fs::read(image_path).map_err(|e| format!("Erro ao ler imagem: {}", e))?;
+
+    let b64 = base64::encode(&image_bytes);
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
+            api_key
+        ))
+        .json(&serde_json::json!({
+            "contents": [{
+                "parts": [
+                    { "text": "Extraia todo o texto desta imagem. Retorne apenas o texto extraído, sem comentários." },
+                    { "inline_data": {
+                        "mime_type": "image/png",
+                        "data": b64
+                    }}
+                ]
+            }]
+        }))
+        .send()
+        .map_err(|e| format!("Erro na requisição: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        return Err(format!("Gemini retornou erro {}: {}", status, body));
+    }
+
+    let result: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("Erro no parse: {}", e))?;
+
+    let text = result["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or("(nenhum texto encontrado)")
+        .to_string();
+
+    println!("☁️ OCR Online: {}", text);
+    Ok(text.trim().to_string())
+}
+
 #[tauri::command]
 fn capture_and_ocr(
     app: tauri::AppHandle,
@@ -239,8 +277,21 @@ fn capture_and_ocr(
     lang: Option<String>,
 ) -> Result<String, String> {
     let path = capture_area(x, y, w, h)?;
-    let ocr_lang = lang.unwrap_or_else(|| "por".to_string());
-    let text = run_ocr(&app, &path, &ocr_lang)?;
+    let settings = load_settings(app.clone());
+    let ocr_lang = lang.unwrap_or(settings.ocr_lang);
+
+    let text = if settings.ocr_mode == "online" {
+        if settings.gemini_api_key.is_empty() {
+            return Err(
+                "Gemini API Key não configurada. Vá em Configurações > OCR > Chave da API."
+                    .to_string(),
+            );
+        }
+        run_ocr_online(&path, &settings.gemini_api_key)?
+    } else {
+        run_ocr(&app, &path, &ocr_lang)?
+    };
+
     let _ = std::fs::remove_file(&path);
     Ok(text)
 }
@@ -250,14 +301,11 @@ fn show_result_window(app: tauri::AppHandle, text: String) {
     if let Ok(mut last) = LAST_OCR_RESULT.lock() {
         *last = text;
     }
-
-    // Se a janela já existe, só traz pra frente
     if let Some(window) = app.get_webview_window("result") {
         let _ = window.show();
         let _ = window.set_focus();
         return;
     }
-
     let _ =
         tauri::WebviewWindowBuilder::new(&app, "result", tauri::WebviewUrl::App("/result".into()))
             .inner_size(520.0, 640.0)
@@ -283,12 +331,9 @@ fn close_result_window(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn show_result(app: tauri::AppHandle, text: String) {
-    // 1. Salva o texto
     if let Ok(mut last) = LAST_OCR_RESULT.lock() {
         *last = text;
     }
-
-    // 2. Fecha todos os overlays
     for label in app.webview_windows().keys() {
         if label.starts_with("overlay-") {
             if let Some(window) = app.get_webview_window(label) {
@@ -296,14 +341,11 @@ fn show_result(app: tauri::AppHandle, text: String) {
             }
         }
     }
-
-    // 3. Abre ou mostra a janela de resultado
     if let Some(window) = app.get_webview_window("result") {
         let _ = window.show();
         let _ = window.set_focus();
         return;
     }
-
     let _ =
         tauri::WebviewWindowBuilder::new(&app, "result", tauri::WebviewUrl::App("/result".into()))
             .inner_size(520.0, 640.0)
@@ -315,61 +357,126 @@ fn show_result(app: tauri::AppHandle, text: String) {
             .build();
 }
 
+fn parse_shortcut(shortcut: &str) -> (bool, bool, bool, bool, Option<Key>) {
+    let parts: Vec<&str> = shortcut.split('+').collect();
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut meta = false;
+    let mut key = None;
+
+    for part in parts {
+        match part.trim() {
+            "Ctrl" => ctrl = true,
+            "Alt" => alt = true,
+            "Shift" => shift = true,
+            "Win" | "Meta" | "Super" => meta = true,
+            "Space" => key = Some(Key::Space),
+            "Enter" => key = Some(Key::Return),
+            "Tab" => key = Some(Key::Tab),
+            "Escape" | "Esc" => key = Some(Key::Escape),
+            "BackSpace" | "Back" => key = Some(Key::Backspace),
+            "CapsLock" => key = Some(Key::CapsLock),
+            "Delete" | "Del" => key = Some(Key::Delete),
+            "Insert" => key = Some(Key::Insert),
+            "Home" => key = Some(Key::Home),
+            "End" => key = Some(Key::End),
+            "PageUp" => key = Some(Key::PageUp),
+            "PageDown" => key = Some(Key::PageDown),
+            "Up" => key = Some(Key::UpArrow),
+            "Down" => key = Some(Key::DownArrow),
+            "Left" => key = Some(Key::LeftArrow),
+            "Right" => key = Some(Key::RightArrow),
+            "A" => key = Some(Key::KeyA),
+            "B" => key = Some(Key::KeyB),
+            "C" => key = Some(Key::KeyC),
+            "D" => key = Some(Key::KeyD),
+            "E" => key = Some(Key::KeyE),
+            "F" => key = Some(Key::KeyF),
+            "G" => key = Some(Key::KeyG),
+            "H" => key = Some(Key::KeyH),
+            "I" => key = Some(Key::KeyI),
+            "J" => key = Some(Key::KeyJ),
+            "K" => key = Some(Key::KeyK),
+            "L" => key = Some(Key::KeyL),
+            "M" => key = Some(Key::KeyM),
+            "N" => key = Some(Key::KeyN),
+            "O" => key = Some(Key::KeyO),
+            "P" => key = Some(Key::KeyP),
+            "Q" => key = Some(Key::KeyQ),
+            "R" => key = Some(Key::KeyR),
+            "S" => key = Some(Key::KeyS),
+            "T" => key = Some(Key::KeyT),
+            "U" => key = Some(Key::KeyU),
+            "V" => key = Some(Key::KeyV),
+            "W" => key = Some(Key::KeyW),
+            "X" => key = Some(Key::KeyX),
+            "Y" => key = Some(Key::KeyY),
+            "Z" => key = Some(Key::KeyZ),
+            "F1" => key = Some(Key::F1),
+            "F2" => key = Some(Key::F2),
+            "F3" => key = Some(Key::F3),
+            "F4" => key = Some(Key::F4),
+            "F5" => key = Some(Key::F5),
+            "F6" => key = Some(Key::F6),
+            "F7" => key = Some(Key::F7),
+            "F8" => key = Some(Key::F8),
+            "F9" => key = Some(Key::F9),
+            "F10" => key = Some(Key::F10),
+            "F11" => key = Some(Key::F11),
+            "F12" => key = Some(Key::F12),
+            _ => {}
+        }
+    }
+
+    (ctrl, alt, shift, meta, key)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // Resolve caminhos do Tesseract
             let (tesseract_exe, tesseract_tessdata) = {
-                // Lista de lugares pra procurar, em ordem de prioridade
-                let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
+                let mut encontrado = None;
 
-                // 1) Pasta binaries/ do lado do executável (funciona no .exe se colocar junto)
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(exe_dir) = exe.parent() {
-                        candidates.push((
-                            exe_dir.join("binaries/tesseract.exe"),
-                            exe_dir.join("binaries/tessdata"),
-                        ));
+                // 1) CARGO_MANIFEST_DIR = src-tauri/ (funciona SEMPRE no dev)
+                let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let exe_candidate = base.join("binaries").join("tesseract.exe");
+                let tess_candidate = base.join("binaries").join("tessdata");
+                if exe_candidate.exists() && tess_candidate.exists() {
+                    encontrado = Some((exe_candidate, tess_candidate));
+                }
+
+                // 2) Resource dir (funciona no build/produção)
+                if encontrado.is_none() {
+                    if let Ok(resource) = app.path().resource_dir() {
+                        let exe_candidate = resource.join("binaries").join("tesseract.exe");
+                        let tess_candidate = resource.join("binaries").join("tessdata");
+                        if exe_candidate.exists() && tess_candidate.exists() {
+                            encontrado = Some((exe_candidate, tess_candidate));
+                        }
                     }
                 }
 
-                // 2) Resource dir (caminho que o Tauri usa em produção)
-                if let Ok(resource) = app.path().resource_dir() {
-                    candidates.push((
-                        resource.join("binaries/tesseract.exe"),
-                        resource.join("binaries/tessdata"),
-                    ));
-                }
-
-                // 3) Pasta src-tauri/binaries/ relativa ao diretório atual (funciona no dev)
-                if let Ok(cwd) = std::env::current_dir() {
-                    candidates.push((
-                        cwd.join("src-tauri/binaries/tesseract.exe"),
-                        cwd.join("src-tauri/binaries/tessdata"),
-                    ));
-                }
-
-                // 4) Instalação padrão do Windows
-                candidates.push((
-                    PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-                    PathBuf::from(r"C:\Program Files\Tesseract-OCR\tessdata"),
-                ));
-
-                // Procura o primeiro que existe
-                let mut found = None;
-                for (exe_path, tess_path) in &candidates {
-                    if exe_path.exists() && tess_path.exists() {
-                        println!("✅ Tesseract encontrado em: {:?}", exe_path);
-                        found = Some((exe_path.clone(), tess_path.clone()));
-                        break;
+                // 3) Lado do próprio executável (funciona em cenários portáteis)
+                if encontrado.is_none() {
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        if let Some(exe_dir) = exe_path.parent() {
+                            let exe_candidate = exe_dir.join("binaries").join("tesseract.exe");
+                            let tess_candidate = exe_dir.join("binaries").join("tessdata");
+                            if exe_candidate.exists() && tess_candidate.exists() {
+                                encontrado = Some((exe_candidate, tess_candidate));
+                            }
+                        }
                     }
                 }
 
-                found.unwrap_or_else(|| {
-                    eprintln!("⚠️ Tesseract não encontrado em nenhum lugar!");
-                    eprintln!("   Crie a pasta src-tauri/binaries/ com tesseract.exe e tessdata/");
-                    // Retorna o último candidato mesmo assim — o erro vai aparecer naturalmente
-                    candidates.last().cloned().unwrap()
+                // 4) Fallback: instalação padrão Windows
+                encontrado.unwrap_or_else(|| {
+                    eprintln!("⚠️ Tesseract não encontrado em nenhum lugar.");
+                    (
+                        PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+                        PathBuf::from(r"C:\Program Files\Tesseract-OCR\tessdata"),
+                    )
                 })
             };
 
@@ -378,16 +485,17 @@ pub fn run() {
                 tessdata: tesseract_tessdata,
             });
 
+            println!("🔧 Tesseract exe: {:?}", app.state::<TesseractPaths>().exe);
             println!(
-                "🔧 Usando Tesseract: {:?}",
-                app.state::<TesseractPaths>().exe
-            );
-            println!(
-                "🔧 Usando tessdata: {:?}",
+                "🔧 Tesseract tessdata: {:?}",
                 app.state::<TesseractPaths>().tessdata
             );
 
-            // Configura a janela principal — a rota é decidida pelo frontend
+            let saved = load_settings(app.handle().clone());
+            if let Some(state) = app.try_state::<ShortcutState>() {
+                *state.0.lock().unwrap() = saved.shortcut;
+            }
+
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_size(tauri::LogicalSize::new(480.0, 640.0));
                 let _ = window.set_resizable(false);
@@ -396,7 +504,6 @@ pub fn run() {
                 let _ = window.set_focus();
             }
 
-            // Fechar = minimizar pro tray (não sair)
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| {
@@ -407,7 +514,6 @@ pub fn run() {
                 });
             }
 
-            // Menu do tray
             let show = MenuItem::with_id(app, "show", "Abrir Janela", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -432,73 +538,86 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // ─── Inicializa ShortcutState com o atalho salvo ───
+            let saved_shortcut = load_settings(app.handle().clone()).shortcut;
+            app.manage(ShortcutState(Arc::new(Mutex::new(saved_shortcut))));
+
             // 🎯 KEYHOOK - thread separada escutando o teclado
+            let shortcut_arc = app.state::<ShortcutState>().0.clone();
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                listen(move |event| match event.event_type {
-                    EventType::KeyPress(Key::Alt) | EventType::KeyPress(Key::ControlRight) => {
-                        println!("ALT PRESSIONADO");
-                        let mut ctrl = ALT_PRESSED.lock().unwrap();
-                        *ctrl = true;
-                    }
-                    EventType::KeyRelease(Key::Alt) | EventType::KeyRelease(Key::ControlRight) => {
-                        println!("CTRL SOLTO");
-                        let mut ctrl = ALT_PRESSED.lock().unwrap();
-                        *ctrl = false;
-                    }
-                    EventType::KeyPress(Key::ShiftLeft) | EventType::KeyPress(Key::ShiftRight) => {
-                        println!("SHIFT PRESSIONADO");
-                        let mut shift = SHIFT_PRESSED.lock().unwrap();
-                        *shift = true;
-                    }
-                    EventType::KeyRelease(Key::ShiftLeft)
-                    | EventType::KeyRelease(Key::ShiftRight) => {
-                        println!("SHIFT SOLTO");
-                        let mut shift = SHIFT_PRESSED.lock().unwrap();
-                        *shift = false;
-                    }
-                    EventType::KeyPress(Key::KeyT) => {
-                        let ctrl = *ALT_PRESSED.lock().unwrap();
-                        let shift = *SHIFT_PRESSED.lock().unwrap();
-                        if ctrl && shift {
-                            println!("Atalho detectado! Criando overlay");
+                let mut ctrl_pressed = false;
+                let mut alt_pressed = false;
+                let mut shift_pressed = false;
+                let mut meta_pressed = false;
 
-                            {
-                                let mut c = ALT_PRESSED.lock().unwrap();
-                                *c = false;
-                            }
+                if let Err(e) = listen(move |event| {
+                    let current = shortcut_arc.lock().unwrap().clone();
+                    let (need_ctrl, need_alt, need_shift, need_meta, need_key) =
+                        parse_shortcut(&current);
 
-                            {
-                                let mut s = SHIFT_PRESSED.lock().unwrap();
-                                *s = false;
-                            }
+                    match event.event_type {
+                        EventType::KeyPress(key) => match key {
+                            Key::ControlLeft | Key::ControlRight => ctrl_pressed = true,
+                            Key::Alt | Key::AltGr => alt_pressed = true,
+                            Key::ShiftLeft | Key::ShiftRight => shift_pressed = true,
+                            Key::MetaLeft | Key::MetaRight => meta_pressed = true,
+                            _ => {
+                                if let Some(expected_key) = need_key {
+                                    if ctrl_pressed == need_ctrl
+                                        && alt_pressed == need_alt
+                                        && shift_pressed == need_shift
+                                        && meta_pressed == need_meta
+                                        && key == expected_key
+                                    {
+                                        println!(
+                                            "🎯 Atalho '{}' detectado! Criando overlay",
+                                            current
+                                        );
+                                        ctrl_pressed = false;
+                                        alt_pressed = false;
+                                        shift_pressed = false;
+                                        meta_pressed = false;
 
-                            if app_handle.get_webview_window("overlay").is_none() {
-                                if let Ok(monitors) = app_handle.available_monitors() {
-                                    for (i, monitor) in monitors.iter().enumerate() {
-                                        let pos = monitor.position();
-                                        let size = monitor.size();
-                                        let label = format!("overlay-{}", i);
-
-                                        let _ = tauri::WebviewWindowBuilder::new(
-                                            &app_handle,
-                                            &label,
-                                            tauri::WebviewUrl::App("/overlay".into()),
-                                        )
-                                        .position(pos.x as f64, pos.y as f64)
-                                        .inner_size(size.width as f64, size.height as f64)
-                                        .transparent(true)
-                                        .decorations(false)
-                                        .always_on_top(true)
-                                        .build();
+                                        if app_handle.get_webview_window("overlay").is_none() {
+                                            if let Ok(monitors) = app_handle.available_monitors() {
+                                                for (i, monitor) in monitors.iter().enumerate() {
+                                                    let pos = monitor.position();
+                                                    let size = monitor.size();
+                                                    let label = format!("overlay-{}", i);
+                                                    let _ = tauri::WebviewWindowBuilder::new(
+                                                        &app_handle,
+                                                        &label,
+                                                        tauri::WebviewUrl::App("/overlay".into()),
+                                                    )
+                                                    .position(pos.x as f64, pos.y as f64)
+                                                    .inner_size(
+                                                        size.width as f64,
+                                                        size.height as f64,
+                                                    )
+                                                    .transparent(true)
+                                                    .decorations(false)
+                                                    .always_on_top(true)
+                                                    .build();
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
+                        },
+                        EventType::KeyRelease(key) => match key {
+                            Key::ControlLeft | Key::ControlRight => ctrl_pressed = false,
+                            Key::Alt | Key::AltGr => alt_pressed = false,
+                            Key::ShiftLeft | Key::ShiftRight => shift_pressed = false,
+                            Key::MetaLeft | Key::MetaRight => meta_pressed = false,
+                            _ => {}
+                        },
+                        _ => {}
                     }
-                    _ => {}
-                })
-                .unwrap();
+                }) {
+                    eprintln!("❌ Erro no rdev: {:?}", e);
+                }
             });
 
             Ok(())
@@ -514,7 +633,7 @@ pub fn run() {
             show_result_window,
             get_last_ocr_result,
             close_result_window,
-            show_result
+            show_result,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
