@@ -10,6 +10,11 @@ interface Settings {
   gemini_api_key: string;
 }
 
+interface OcrLanguageInfo {
+  tag: string;
+  display_name: string;
+}
+
 const modifierKeys = ["Ctrl", "Shift", "Alt", "Win"] as const;
 const mainKeys = [
   { label: "A", value: "A" },
@@ -52,12 +57,13 @@ const mainKeys = [
 function Settings() {
   const [settings, setSettings] = useState<Settings>({
     deepl_api_key: "",
-    ocr_lang: "por",
+    ocr_lang: "auto",
     translate_to: "EN",
     shortcut: "Ctrl+Shift+S",
-    ocr_mode: "online",
+    ocr_mode: "local",
     gemini_api_key: "",
   });
+  const [availableLanguages, setAvailableLanguages] = useState<OcrLanguageInfo[]>([]);
   const [saved, setSaved] = useState(false);
   const [showDeeplKey, setShowDeeplKey] = useState(false);
   const [deeplKeyTemp, setDeeplKeyTemp] = useState("");
@@ -68,6 +74,11 @@ function Settings() {
 
   useEffect(() => {
     loadSettings();
+    invoke<OcrLanguageInfo[]>("get_available_ocr_languages")
+      .then((langs) => {
+        if (langs && langs.length > 0) setAvailableLanguages(langs);
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -222,13 +233,13 @@ function Settings() {
                   outline: "none",
                 }}
               >
-                💻 Local (Tesseract)
+                💻 Local (Windows OCR)
               </button>
             </div>
             <p style={{ margin: "10px 0 0", fontSize: 12, color: textSecondary, lineHeight: 1.4 }}>
               {settings.ocr_mode === "online"
-                ? "☁️ Recomendado. Requer chave da API Gemini. Rápido e sem instalação."
-                : "💻 Para uso offline. Requer o Tesseract instalado no sistema (você assume a configuração)."}
+                ? "☁️ Requer chave da API Gemini. Processamento na nuvem."
+                : "💻 OCR Nativo Offline do Windows. Ultrarrápido (<100ms), sem instalação de DLLs ou binários extras."}
             </p>
           </div>
 
@@ -508,12 +519,23 @@ function Settings() {
                     cursor: "pointer",
                   }}
                 >
-                  <option value="por">Português</option>
-                  <option value="eng">Inglês</option>
-                  <option value="spa">Espanhol</option>
-                  <option value="fra">Francês</option>
-                  <option value="deu">Alemão</option>
-                  <option value="ita">Italiano</option>
+                  <option value="auto">🌐 Automático (Perfil do Windows)</option>
+                  {availableLanguages.length > 0 ? (
+                    availableLanguages.map((l) => (
+                      <option key={l.tag} value={l.tag}>
+                        {l.display_name} ({l.tag})
+                      </option>
+                    ))
+                  ) : (
+                    <>
+                      <option value="pt-BR">Português (Brasil)</option>
+                      <option value="en-US">Inglês (EUA)</option>
+                      <option value="es-ES">Espanhol</option>
+                      <option value="fr-FR">Francês</option>
+                      <option value="de-DE">Alemão</option>
+                      <option value="it-IT">Italiano</option>
+                    </>
+                  )}
                 </select>
               </div>
               <div>

@@ -8,7 +8,7 @@ async function closeAllOverlays() {
 function Overlay() {
   const [ocrResult, setOcrResult] = useState<string | null>(null);
   const [translatedResult, setTranslatedResult] = useState<string | null>(null);
-  const [ocrLang, setOcrLang] = useState("por");
+  const [ocrLang, setOcrLang] = useState("auto");
   const [translateLang, setTranslateLang] = useState("EN");
   const [translating, setTranslating] = useState(false);
 
@@ -151,19 +151,20 @@ function Overlay() {
       setOcrResult(text);
       setTranslatedResult(null);
 
-      try {
-        setTranslating(true);
-        const translated = await invoke<string>("translate_text_cmd", {
-          text,
-          targetLang: translateLang,
-        });
-        setTranslatedResult(translated);
-      } catch (error:any) {
-        const msg = typeof error === 'string' ? error : error?.message || 'Erro na tradução';
-        setTranslatedResult(msg);
-        // mantém só o OCR
-      } finally {
-        setTranslating(false);
+      if (text && text !== "(nenhum texto encontrado)" && !text.startsWith("Erro")) {
+        try {
+          setTranslating(true);
+          const translated = await invoke<string>("translate_text_cmd", {
+            text,
+            targetLang: translateLang,
+          });
+          setTranslatedResult(translated);
+        } catch (error: any) {
+          const msg = typeof error === "string" ? error : error?.message || "Erro na tradução";
+          setTranslatedResult(msg);
+        } finally {
+          setTranslating(false);
+        }
       }
     } catch (err) {
       console.error("❌ Erro:", err);
@@ -177,6 +178,7 @@ function Overlay() {
     setDrawing(false);
     stopAnimation();
 
+    const dpr = window.devicePixelRatio || 1;
     const relX = Math.min(start.current.x, end.current.x);
     const relY = Math.min(start.current.y, end.current.y);
     const w = Math.abs(end.current.x - start.current.x);
@@ -184,12 +186,15 @@ function Overlay() {
 
     if (w < 5 || h < 5) return;
 
-    const absX = relX + window.screenLeft;
-    const absY = relY + window.screenTop;
+    // Coordenadas convertidas para pixels físicos reais da tela (DPI Scaling)
+    const absX = Math.round((relX + window.screenLeft) * dpr);
+    const absY = Math.round((relY + window.screenTop) * dpr);
+    const physW = Math.round(w * dpr);
+    const physH = Math.round(h * dpr);
 
-    lastCapture.current = { absX, absY, w, h };
+    lastCapture.current = { absX, absY, w: physW, h: physH };
 
-    await doCapture(absX, absY, w, h, ocrLang);
+    await doCapture(absX, absY, physW, physH, ocrLang);
   }
 
   async function handleOcrLangChange(newLang: string) {
@@ -302,12 +307,13 @@ function Overlay() {
                 outline: "none",
               }}
             >
-              <option value="por">Português</option>
-              <option value="eng">Inglês</option>
-              <option value="spa">Espanhol</option>
-              <option value="fra">Francês</option>
-              <option value="deu">Alemão</option>
-              <option value="ita">Italiano</option>
+              <option value="auto">🌐 Automático (Windows)</option>
+              <option value="pt-BR">Português</option>
+              <option value="en-US">Inglês</option>
+              <option value="es-ES">Espanhol</option>
+              <option value="fr-FR">Francês</option>
+              <option value="de-DE">Alemão</option>
+              <option value="it-IT">Italiano</option>
             </select>
 
             <span style={{ color: "#555", fontSize: 14 }}>→</span>

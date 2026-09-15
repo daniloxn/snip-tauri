@@ -10,9 +10,120 @@ use tauri::{
     Manager,
 };
 
-struct TesseractPaths {
-    exe: PathBuf,
-    tessdata: PathBuf,
+#[cfg(windows)]
+pub mod win_ocr {
+    use windows::{
+        core::HSTRING,
+        Globalization::Language,
+        Graphics::Imaging::BitmapDecoder,
+        Media::Ocr::OcrEngine,
+        Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
+    };
+
+    pub fn run_windows_ocr(png_bytes: &[u8], lang_tag: Option<&str>) -> Result<String, String> {
+        let stream = InMemoryRandomAccessStream::new()
+            .map_err(|e| format!("Falha ao criar stream WinRT: {}", e))?;
+
+        let writer = DataWriter::CreateDataWriter(&stream)
+            .map_err(|e| format!("Falha ao criar DataWriter: {}", e))?;
+
+        writer
+            .WriteBytes(png_bytes)
+            .map_err(|e| format!("Falha ao escrever bytes no DataWriter: {}", e))?;
+
+        writer
+            .StoreAsync()
+            .map_err(|e| format!("Falha ao armazenar buffer: {}", e))?
+            .get()
+            .map_err(|e| format!("Falha no StoreAsync: {}", e))?;
+
+        writer
+            .FlushAsync()
+            .map_err(|e| format!("Falha ao descarregar buffer: {}", e))?
+            .get()
+            .map_err(|e| format!("Falha no FlushAsync: {}", e))?;
+
+        stream
+            .Seek(0)
+            .map_err(|e| format!("Falha ao posicionar stream: {}", e))?;
+
+        let decoder = BitmapDecoder::CreateAsync(&stream)
+            .map_err(|e| format!("Falha ao decodificar imagem: {}", e))?
+            .get()
+            .map_err(|e| format!("Falha ao obter decoder: {}", e))?;
+
+        let software_bitmap = decoder
+            .GetSoftwareBitmapAsync()
+            .map_err(|e| format!("Falha ao obter SoftwareBitmap: {}", e))?
+            .get()
+            .map_err(|e| format!("Falha no GetSoftwareBitmapAsync: {}", e))?;
+
+        let engine = if let Some(tag) = lang_tag {
+            let trimmed = tag.trim();
+            if !trimmed.is_empty() && trimmed != "auto" {
+                let win_lang = Language::CreateLanguage(&HSTRING::from(trimmed))
+                    .map_err(|e| format!("Idioma inválido '{}': {}", trimmed, e))?;
+                if OcrEngine::IsLanguageSupported(&win_lang).unwrap_or(false) {
+                    OcrEngine::TryCreateFromLanguage(&win_lang)
+                        .map_err(|e| format!("Falha ao criar motor OCR para '{}': {}", trimmed, e))?
+                } else {
+                    OcrEngine::TryCreateFromUserProfileLanguages()
+                        .map_err(|e| format!("Falha ao inicializar OCR do usuário: {}", e))?
+                }
+            } else {
+                OcrEngine::TryCreateFromUserProfileLanguages()
+                    .map_err(|e| format!("Falha ao inicializar OCR do usuário: {}", e))?
+            }
+        } else {
+            OcrEngine::TryCreateFromUserProfileLanguages()
+                .map_err(|e| format!("Falha ao inicializar OCR do usuário: {}", e))?
+        };
+
+        let ocr_op = engine
+            .RecognizeAsync(&software_bitmap)
+            .map_err(|e| format!("Falha ao disparar OCR: {}", e))?;
+
+        let ocr_result = ocr_op
+            .get()
+            .map_err(|e| format!("Falha ao processar OCR: {}", e))?;
+
+        let text = ocr_result
+            .Text()
+            .map_err(|e| format!("Falha ao extrair texto: {}", e))?
+            .to_string();
+
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            Ok("(nenhum texto encontrado)".to_string())
+        } else {
+            Ok(trimmed)
+        }
+    }
+
+    #[derive(serde::Serialize, Clone, Debug)]
+    pub struct OcrLanguageInfo {
+        pub tag: String,
+        pub display_name: String,
+    }
+
+    pub fn get_available_languages() -> Vec<OcrLanguageInfo> {
+        let mut list = Vec::new();
+        if let Ok(languages) = OcrEngine::AvailableRecognizerLanguages() {
+            for lang in languages {
+                if let Ok(tag_hstring) = lang.LanguageTag() {
+                    let tag = tag_hstring.to_string();
+                    let display_name = lang
+                        .DisplayName()
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|_| tag.clone());
+                    if !tag.is_empty() {
+                        list.push(OcrLanguageInfo { tag, display_name });
+                    }
+                }
+            }
+        }
+        list
+    }
 }
 
 static LAST_OCR_RESULT: Mutex<String> = Mutex::new(String::new());
@@ -33,10 +144,10 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             deepl_api_key: String::new(),
-            ocr_lang: "por".to_string(),
+            ocr_lang: "auto".to_string(),
             translate_to: "en".to_string(),
             shortcut: "Ctrl+Shift+S".to_string(),
-            ocr_mode: "online".to_string(),
+            ocr_mode: "local".to_string(),
             gemini_api_key: String::new(),
         }
     }
@@ -102,13 +213,24 @@ fn close_overlay_windows(app: tauri::AppHandle) {
 }
 
 fn translate_text(text: &str, api_key: &str, target_lang: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "(nenhum texto encontrado)" {
+        return Ok(String::new());
+    }
+
+    let normalized_target = match target_lang.to_uppercase().as_str() {
+        "EN" => "EN-US".to_string(),
+        "PT" => "PT-BR".to_string(),
+        other => other.to_string(),
+    };
+
     let client = reqwest::blocking::Client::new();
     let response = client
         .post("https://api-free.deepl.com/v2/translate")
         .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
         .json(&serde_json::json!({
-            "text": [text],
-            "target_lang": target_lang.to_uppercase(),
+            "text": [trimmed],
+            "target_lang": normalized_target,
         }))
         .send()
         .map_err(|e| format!("Erro ao chamar DeepL: {}", e))?;
@@ -151,9 +273,8 @@ fn translate_text_cmd(
     translate_text(&text, &settings.deepl_api_key, &lang)
 }
 
-fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, String> {
+fn capture_area_to_png_bytes(x: i32, y: i32, w: i32, h: i32) -> Result<Vec<u8>, String> {
     use screenshots::Screen;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let screens = Screen::all().map_err(|e| e.to_string())?;
     let target = screens
@@ -174,54 +295,21 @@ fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<std::path::PathBuf, St
         .capture_area(rel_x, rel_y, w as u32, h as u32)
         .map_err(|e| e.to_string())?;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let temp_path = std::env::temp_dir().join(format!("snipp_{}.png", timestamp));
-    image.save(&temp_path).map_err(|e| e.to_string())?;
-    println!("📸 Capturado: {}", temp_path.display());
-    Ok(temp_path)
+    let mut png_bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            screenshots::image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("Erro ao codificar PNG em memória: {}", e))?;
+
+    println!("📸 Capturado em RAM: {} bytes", png_bytes.len());
+    Ok(png_bytes)
 }
 
-fn run_ocr(
-    app: &tauri::AppHandle,
-    image_path: &std::path::Path,
-    ocr_lang: &str,
-) -> Result<String, String> {
-    use std::process::Command;
-
-    let tess_paths = app.state::<TesseractPaths>();
-
-    use std::os::windows::process::CommandExt;
-    let output = Command::new(&tess_paths.exe)
-        .arg(image_path.to_string_lossy().to_string())
-        .arg("stdout")
-        .arg("-l")
-        .arg(ocr_lang)
-        .env("TESSDATA_PREFIX", &tess_paths.tessdata)
-        .output()
-        .map_err(|e| format!("Erro ao executar Tesseract: {}", e))?;
-
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            Ok("(nenhum texto encontrado)".to_string())
-        } else {
-            println!("📝 OCR: {}", text);
-            Ok(text)
-        }
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Erro no OCR: {}", err))
-    }
-}
-
-fn run_ocr_online(image_path: &std::path::Path, api_key: &str) -> Result<String, String> {
-    let image_bytes =
-        std::fs::read(image_path).map_err(|e| format!("Erro ao ler imagem: {}", e))?;
-
-    let b64 = base64::encode(&image_bytes);
+fn run_ocr_online(image_bytes: &[u8], api_key: &str) -> Result<String, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
 
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -271,7 +359,7 @@ fn capture_and_ocr(
     h: i32,
     lang: Option<String>,
 ) -> Result<String, String> {
-    let path = capture_area(x, y, w, h)?;
+    let png_bytes = capture_area_to_png_bytes(x, y, w, h)?;
     let settings = load_settings(app.clone());
     let ocr_lang = lang.unwrap_or(settings.ocr_lang);
 
@@ -282,13 +370,31 @@ fn capture_and_ocr(
                     .to_string(),
             );
         }
-        run_ocr_online(&path, &settings.gemini_api_key)?
+        run_ocr_online(&png_bytes, &settings.gemini_api_key)?
     } else {
-        run_ocr(&app, &path, &ocr_lang)?
+        #[cfg(windows)]
+        {
+            win_ocr::run_windows_ocr(&png_bytes, Some(&ocr_lang))?
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("OCR local suportado atualmente apenas no Windows".to_string());
+        }
     };
 
-    let _ = std::fs::remove_file(&path);
     Ok(text)
+}
+
+#[tauri::command]
+fn get_available_ocr_languages() -> Vec<win_ocr::OcrLanguageInfo> {
+    #[cfg(windows)]
+    {
+        win_ocr::get_available_languages()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 #[tauri::command]
@@ -430,61 +536,7 @@ fn parse_shortcut(shortcut: &str) -> (bool, bool, bool, bool, Option<Key>) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let (tesseract_exe, tesseract_tessdata) = {
-                let mut encontrado = None;
-
-                // 1) CARGO_MANIFEST_DIR = src-tauri/ (funciona SEMPRE no dev)
-                let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                let exe_candidate = base.join("binaries").join("tesseract.exe");
-                let tess_candidate = base.join("binaries").join("tessdata");
-                if exe_candidate.exists() && tess_candidate.exists() {
-                    encontrado = Some((exe_candidate, tess_candidate));
-                }
-
-                // 2) Resource dir (funciona no build/produção)
-                if encontrado.is_none() {
-                    if let Ok(resource) = app.path().resource_dir() {
-                        let exe_candidate = resource.join("binaries").join("tesseract.exe");
-                        let tess_candidate = resource.join("binaries").join("tessdata");
-                        if exe_candidate.exists() && tess_candidate.exists() {
-                            encontrado = Some((exe_candidate, tess_candidate));
-                        }
-                    }
-                }
-
-                // 3) Lado do próprio executável (funciona em cenários portáteis)
-                if encontrado.is_none() {
-                    if let Ok(exe_path) = std::env::current_exe() {
-                        if let Some(exe_dir) = exe_path.parent() {
-                            let exe_candidate = exe_dir.join("binaries").join("tesseract.exe");
-                            let tess_candidate = exe_dir.join("binaries").join("tessdata");
-                            if exe_candidate.exists() && tess_candidate.exists() {
-                                encontrado = Some((exe_candidate, tess_candidate));
-                            }
-                        }
-                    }
-                }
-
-                // 4) Fallback: instalação padrão Windows
-                encontrado.unwrap_or_else(|| {
-                    eprintln!("⚠️ Tesseract não encontrado em nenhum lugar.");
-                    (
-                        PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-                        PathBuf::from(r"C:\Program Files\Tesseract-OCR\tessdata"),
-                    )
-                })
-            };
-
-            app.manage(TesseractPaths {
-                exe: tesseract_exe,
-                tessdata: tesseract_tessdata,
-            });
-
-            println!("🔧 Tesseract exe: {:?}", app.state::<TesseractPaths>().exe);
-            println!(
-                "🔧 Tesseract tessdata: {:?}",
-                app.state::<TesseractPaths>().tessdata
-            );
+            println!("🚀 Inicializando Snip-Tauri com Windows.Media.Ocr nativo...");
 
             let saved = load_settings(app.handle().clone());
             if let Some(state) = app.try_state::<ShortcutState>() {
@@ -629,6 +681,7 @@ pub fn run() {
             get_last_ocr_result,
             close_result_window,
             show_result,
+            get_available_ocr_languages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
