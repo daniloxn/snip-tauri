@@ -375,27 +375,31 @@ fn translate_text(text: &str, deepl_key: &str, gemini_key: &str, target_lang: &s
     if !gemini_key.is_empty() {
         let client = reqwest::blocking::Client::new();
         let prompt = format!("Traduza o seguinte texto para o idioma '{}'. Retorne APENAS a tradução final, sem aspas, sem explicações:\n\n{}", target_lang, trimmed);
-        let res = client
-            .post(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
-                gemini_key
-            ))
-            .json(&serde_json::json!({
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }]
-            }))
-            .send();
+        
+        let models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+        for model in models {
+            let res = client
+                .post(format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                    model, gemini_key
+                ))
+                .json(&serde_json::json!({
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }]
+                }))
+                .send();
 
-        if let Ok(response) = res {
-            if response.status().is_success() {
-                if let Ok(json) = response.json::<serde_json::Value>() {
-                    if let Some(cands) = json["candidates"].as_array() {
-                        if !cands.is_empty() {
-                            if let Some(t) = cands[0]["content"]["parts"][0]["text"].as_str() {
-                                let t = t.trim().to_string();
-                                println!("🌐 Traduzido (Gemini): {}", t);
-                                return Ok(t);
+            if let Ok(response) = res {
+                if response.status().is_success() {
+                    if let Ok(json) = response.json::<serde_json::Value>() {
+                        if let Some(cands) = json["candidates"].as_array() {
+                            if !cands.is_empty() {
+                                if let Some(t) = cands[0]["content"]["parts"][0]["text"].as_str() {
+                                    let t = t.trim().to_string();
+                                    println!("🌐 Traduzido (Gemini - {}): {}", model, t);
+                                    return Ok(t);
+                                }
                             }
                         }
                     }
@@ -508,42 +512,53 @@ fn run_ocr_online(image_bytes: &[u8], api_key: &str) -> Result<String, String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
 
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
-            api_key
-        ))
-        .json(&serde_json::json!({
-            "contents": [{
-                "parts": [
-                    { "text": "Extraia todo o texto desta imagem. Retorne apenas o texto extraído, sem comentários." },
-                    { "inline_data": {
-                        "mime_type": "image/png",
-                        "data": b64
-                    }}
-                ]
-            }]
-        }))
-        .send()
-        .map_err(|e| format!("Erro na requisição: {}", e))?;
+    let models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+    let mut last_error = String::new();
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("Gemini retornou erro {}: {}", status, body));
+    for model in models {
+        let response = client
+            .post(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, api_key
+            ))
+            .json(&serde_json::json!({
+                "contents": [{
+                    "parts": [
+                        { "text": "Extraia todo o texto desta imagem. Retorne apenas o texto extraído, sem comentários." },
+                        { "inline_data": {
+                            "mime_type": "image/png",
+                            "data": b64
+                        }}
+                    ]
+                }]
+            }))
+            .send();
+
+        match response {
+            Ok(res) => {
+                if res.status().is_success() {
+                    if let Ok(result) = res.json::<serde_json::Value>() {
+                        let text = result["candidates"][0]["content"]["parts"][0]["text"]
+                            .as_str()
+                            .unwrap_or("(nenhum texto encontrado)")
+                            .to_string();
+                        println!("☁️ OCR Online ({}): {}", model, text);
+                        return Ok(text.trim().to_string());
+                    }
+                } else {
+                    let status = res.status();
+                    let body = res.text().unwrap_or_default();
+                    last_error = format!("Gemini ({}) retornou erro {}: {}", model, status, body);
+                    println!("⚠️ Fallback OCR: {}", last_error);
+                }
+            }
+            Err(e) => {
+                last_error = format!("Erro na requisição ({}) : {}", model, e);
+            }
+        }
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .map_err(|e| format!("Erro no parse: {}", e))?;
-
-    let text = result["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or("(nenhum texto encontrado)")
-        .to_string();
-
-    println!("☁️ OCR Online: {}", text);
-    Ok(text.trim().to_string())
+    Err(last_error)
 }
 
 #[tauri::command]
