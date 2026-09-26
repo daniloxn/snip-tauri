@@ -24,6 +24,10 @@ function Overlay() {
   const [copiedBadge, setCopiedBadge] = useState<string | null>(null);
   const [isMinimized, setIsMinimized] = useState(false);
   const [isPinned, setIsPinned] = useState(false);
+  const [cardWidth, setCardWidth] = useState<number>(720);
+  const [cardHeight, setCardHeight] = useState<number>(240);
+  const isResizing = useRef(false);
+  const resizeStartPos = useRef({ x: 0, y: 0, startW: 720, startH: 240 });
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [drawing, setDrawing] = useState(false);
@@ -296,6 +300,34 @@ function Overlay() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  // Handler para redimensionamento do card pela borda/cantoneira
+  useEffect(() => {
+    function handleWindowMouseMove(e: MouseEvent) {
+      if (!isResizing.current) return;
+      const dx = resizeStartPos.current.x - e.clientX;
+      const dy = resizeStartPos.current.y - e.clientY;
+      const newW = Math.max(380, Math.min(window.innerWidth - 60, resizeStartPos.current.startW + dx));
+      const newH = Math.max(160, Math.min(window.innerHeight - 100, resizeStartPos.current.startH + dy));
+      setCardWidth(newW);
+      setCardHeight(newH);
+    }
+
+    function handleWindowMouseUp() {
+      if (isResizing.current) {
+        isResizing.current = false;
+        document.body.style.cursor = "default";
+        document.body.style.userSelect = "auto";
+      }
+    }
+
+    window.addEventListener("mousemove", handleWindowMouseMove);
+    window.addEventListener("mouseup", handleWindowMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleWindowMouseMove);
+      window.removeEventListener("mouseup", handleWindowMouseUp);
+    };
+  }, []);
+
   function startAnimation() {
     function loop() {
       pulse.current = (pulse.current + 0.03) % (Math.PI * 2);
@@ -500,136 +532,248 @@ function Overlay() {
         </div>
       )}
 
-      {/* Card Flutuante de Resultado: Não interfere na seleção e permite minimizar */}
+      {/* Card Flutuante de Resultado: Não interfere na seleção e permite minimizar/redimensionar */}
       {hasResult && (
         <div
           style={{
             position: "fixed",
             bottom: isMinimized ? 16 : 28,
             right: 28,
-            width: isMinimized ? 320 : "min(720px, calc(100vw - 56px))",
+            width: isMinimized ? "auto" : Math.min(cardWidth, window.innerWidth - 56),
+            height: isMinimized ? "auto" : Math.min(cardHeight, window.innerHeight - 80),
+            minWidth: isMinimized ? 220 : 380,
+            maxWidth: "calc(100vw - 56px)",
+            maxHeight: "calc(100vh - 56px)",
             background: "rgba(12, 15, 23, 0.94)",
             backdropFilter: "blur(24px) saturate(180%)",
-            borderRadius: 12,
+            borderRadius: isMinimized ? 24 : 12,
             border: "1px solid rgba(56, 189, 248, 0.22)",
             boxShadow: "0 20px 50px rgba(0, 0, 0, 0.7), 0 0 24px rgba(56, 189, 248, 0.12)",
             zIndex: 10,
             overflow: "hidden",
+            display: "flex",
+            flexDirection: "column",
             fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
-            transition: "all 0.2s cubic-bezier(0.16, 1, 0.3, 1)",
+            transition: isResizing.current ? "none" : "width 0.2s ease, height 0.2s ease, border-radius 0.2s ease",
           }}
         >
-          {/* Barra Superior Compacta */}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              padding: "8px 14px",
-              background: "rgba(255, 255, 255, 0.02)",
-              borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
-            }}
-          >
-            {/* Seletor de Idiomas Rápido */}
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <select
-                value={ocrLang}
-                onChange={(e) => handleOcrLangChange(e.target.value)}
-                style={selectStyle}
-              >
-                <option value="auto">🌐 Detecção Auto</option>
-                <option value="pt-BR">Português (BR)</option>
-                <option value="en-US">Inglês (US)</option>
-                <option value="es-ES">Espanhol</option>
-                <option value="fr-FR">Francês</option>
-                <option value="de-DE">Alemão</option>
-                <option value="it-IT">Italiano</option>
-              </select>
-
-              <span style={{ color: "#38bdf8", fontSize: 13, fontWeight: 700 }}>→</span>
-
-              <select
-                value={translateLang}
-                onChange={(e) => handleTranslateLangChange(e.target.value)}
-                style={{ ...selectStyle, color: "#38bdf8", borderColor: "rgba(56, 189, 248, 0.35)", fontWeight: 600 }}
-              >
-                <option value="pt-BR">🇧🇷 Português (BR)</option>
-                <option value="en-US">🇺🇸 Inglês (US)</option>
-                <option value="es-ES">🇪🇸 Espanhol</option>
-                <option value="fr-FR">🇫🇷 Francês</option>
-                <option value="de-DE">🇩🇪 Alemão</option>
-                <option value="it-IT">🇮🇹 Italiano</option>
-                <option value="ja-JP">🇯🇵 Japonês</option>
-                <option value="zh-CN">🇨🇳 Chinês</option>
-              </select>
-            </div>
-
-            {/* Ações de Controle: Unwrap, Minimizar, Fechar */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <button
-                onClick={() => setUnwrapLines(!unwrapLines)}
-                title="Junta quebras de linha em parágrafo contínuo"
+          {isMinimized ? (
+            /* Versão Minimizado: Pílula compacta e elegante */
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "6px 14px",
+                gap: 12,
+                userSelect: "none",
+              }}
+            >
+              <div
                 style={{
-                  background: unwrapLines ? "rgba(56, 189, 248, 0.15)" : "rgba(255, 255, 255, 0.04)",
-                  color: unwrapLines ? "#38bdf8" : "#94a3b8",
-                  border: unwrapLines ? "1px solid rgba(56, 189, 248, 0.3)" : "1px solid rgba(255, 255, 255, 0.08)",
-                  borderRadius: 6,
-                  padding: "4px 8px",
-                  fontSize: 11,
-                  fontWeight: 600,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
                   cursor: "pointer",
-                  transition: "all 0.15s ease",
                 }}
+                onClick={() => setIsMinimized(false)}
+                title="Clique para expandir o resultado"
               >
-                {unwrapLines ? "🔗 Fluido" : "↩️ Quebras"}
-              </button>
+                <span style={{ fontSize: 13, color: "#38bdf8", fontWeight: 700 }}>⚡ Snip</span>
+                <span style={{ fontSize: 11, color: "#94a3b8", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {displayTrad || displayOcr || "Resultado pronto"}
+                </span>
+              </div>
 
-              <button
-                onClick={togglePin}
-                title={isPinned ? "Desafixar card (voltar ao modo recorte)" : "Fixar card na tela (permite clicar em outros programas)"}
-                style={{
-                  ...iconBtnStyle,
-                  background: isPinned ? "rgba(56, 189, 248, 0.2)" : "rgba(255, 255, 255, 0.04)",
-                  color: isPinned ? "#38bdf8" : "#94a3b8",
-                  borderColor: isPinned ? "rgba(56, 189, 248, 0.4)" : "rgba(255, 255, 255, 0.08)",
-                }}
-              >
-                📌
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setIsMinimized(false);
+                  }}
+                  title="Expandir card (▲)"
+                  style={{
+                    ...iconBtnStyle,
+                    color: "#38bdf8",
+                    borderColor: "rgba(56, 189, 248, 0.3)",
+                    background: "rgba(56, 189, 248, 0.1)",
+                    fontWeight: 700,
+                  }}
+                >
+                  ▲ Expandir
+                </button>
 
-              <button
-                onClick={() => setIsMinimized(!isMinimized)}
-                title={isMinimized ? "Expandir card" : "Minimizar card para não atrapalhar"}
-                style={iconBtnStyle}
-              >
-                {isMinimized ? "▲" : "▼"}
-              </button>
-
-              <button
-                onClick={closeAllOverlays}
-                title="Fechar overlay (Esc)"
-                style={{ ...iconBtnStyle, color: "#f87171" }}
-              >
-                ✕
-              </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    closeAllOverlays();
+                  }}
+                  title="Fechar (Esc)"
+                  style={{ ...iconBtnStyle, color: "#f87171" }}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
-          </div>
-
-          {/* Conteúdo Expansível */}
-          {!isMinimized && (
+          ) : (
+            /* Versão Expandida com Controles e Redimensionamento */
             <>
+              {/* Alça de Redimensionamento no Canto Superior Esquerdo */}
+              <div
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  isResizing.current = true;
+                  resizeStartPos.current = {
+                    x: e.clientX,
+                    y: e.clientY,
+                    startW: cardWidth,
+                    startH: cardHeight,
+                  };
+                  document.body.style.cursor = "nwse-resize";
+                  document.body.style.userSelect = "none";
+                }}
+                title="Arraste para redimensionar o card"
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: 14,
+                  height: 14,
+                  cursor: "nwse-resize",
+                  zIndex: 20,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <div
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderTop: "2px solid rgba(56, 189, 248, 0.5)",
+                    borderLeft: "2px solid rgba(56, 189, 248, 0.5)",
+                    borderRadius: "1px 0 0 0",
+                  }}
+                />
+              </div>
+
+              {/* Barra Superior Compacta */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "8px 14px",
+                  background: "rgba(255, 255, 255, 0.02)",
+                  borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
+                  flexShrink: 0,
+                }}
+              >
+                {/* Seletor de Idiomas Rápido */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 6 }}>
+                  <select
+                    value={ocrLang}
+                    onChange={(e) => handleOcrLangChange(e.target.value)}
+                    style={selectStyle}
+                  >
+                    <option value="auto">🌐 Detecção Auto</option>
+                    <option value="pt-BR">Português (BR)</option>
+                    <option value="en-US">Inglês (US)</option>
+                    <option value="es-ES">Espanhol</option>
+                    <option value="fr-FR">Francês</option>
+                    <option value="de-DE">Alemão</option>
+                    <option value="it-IT">Italiano</option>
+                  </select>
+
+                  <span style={{ color: "#38bdf8", fontSize: 13, fontWeight: 700 }}>→</span>
+
+                  <select
+                    value={translateLang}
+                    onChange={(e) => handleTranslateLangChange(e.target.value)}
+                    style={{ ...selectStyle, color: "#38bdf8", borderColor: "rgba(56, 189, 248, 0.35)", fontWeight: 600 }}
+                  >
+                    <option value="pt-BR">🇧🇷 Português (BR)</option>
+                    <option value="en-US">🇺🇸 Inglês (US)</option>
+                    <option value="es-ES">🇪🇸 Espanhol</option>
+                    <option value="fr-FR">🇫🇷 Francês</option>
+                    <option value="de-DE">🇩🇪 Alemão</option>
+                    <option value="it-IT">🇮🇹 Italiano</option>
+                    <option value="ja-JP">🇯🇵 Japonês</option>
+                    <option value="zh-CN">🇨🇳 Chinês</option>
+                  </select>
+                </div>
+
+                {/* Ações de Controle: Unwrap, Minimizar, Fechar */}
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <button
+                    onClick={() => setUnwrapLines(!unwrapLines)}
+                    title="Junta quebras de linha em parágrafo contínuo"
+                    style={{
+                      background: unwrapLines ? "rgba(56, 189, 248, 0.15)" : "rgba(255, 255, 255, 0.04)",
+                      color: unwrapLines ? "#38bdf8" : "#94a3b8",
+                      border: unwrapLines ? "1px solid rgba(56, 189, 248, 0.3)" : "1px solid rgba(255, 255, 255, 0.08)",
+                      borderRadius: 6,
+                      padding: "4px 8px",
+                      fontSize: 11,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                      transition: "all 0.15s ease",
+                    }}
+                  >
+                    {unwrapLines ? "🔗 Fluido" : "↩️ Quebras"}
+                  </button>
+
+                  <button
+                    onClick={togglePin}
+                    title={isPinned ? "Desafixar card (voltar ao modo recorte)" : "Fixar card na tela (permite clicar em outros programas)"}
+                    style={{
+                      ...iconBtnStyle,
+                      background: isPinned ? "rgba(56, 189, 248, 0.2)" : "rgba(255, 255, 255, 0.04)",
+                      color: isPinned ? "#38bdf8" : "#94a3b8",
+                      borderColor: isPinned ? "rgba(56, 189, 248, 0.4)" : "rgba(255, 255, 255, 0.08)",
+                    }}
+                  >
+                    📌
+                  </button>
+
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsMinimized(true);
+                    }}
+                    title="Minimizar card para não atrapalhar"
+                    style={iconBtnStyle}
+                  >
+                    ▼
+                  </button>
+
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeAllOverlays();
+                    }}
+                    title="Fechar overlay (Esc)"
+                    style={{ ...iconBtnStyle, color: "#f87171" }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+
               {/* Abas e Ações de Cópia */}
               <div
                 style={{
                   display: "flex",
                   borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
                   background: "rgba(0, 0, 0, 0.2)",
+                  flexShrink: 0,
                 }}
               >
                 <div
                   style={{
                     flex: 1,
-                    padding: "8px 14px",
+                    padding: "6px 14px",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
@@ -653,7 +797,7 @@ function Overlay() {
                 <div
                   style={{
                     flex: 1,
-                    padding: "8px 14px",
+                    padding: "6px 14px",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
@@ -679,8 +823,8 @@ function Overlay() {
                 </div>
               </div>
 
-              {/* Textos Lado a Lado */}
-              <div style={{ display: "flex", minHeight: 74, maxHeight: 180 }}>
+              {/* Textos Lado a Lado Flexíveis */}
+              <div style={{ display: "flex", flex: 1, minHeight: 70, overflow: "hidden" }}>
                 <div style={textAreaStyle}>
                   {runningOcr ? (
                     <span style={{ color: "#38bdf8", fontStyle: "italic", fontSize: 12 }}>
@@ -715,6 +859,7 @@ function Overlay() {
                   justifyContent: "space-between",
                   fontSize: 11,
                   color: "#64748b",
+                  flexShrink: 0,
                 }}
               >
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
